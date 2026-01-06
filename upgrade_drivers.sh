@@ -83,6 +83,16 @@ run_cmd() {
     fi
 }
 
+validate_container() {
+    local ct=$1
+    # Check if container exists
+    if ! pct status "$ct" &>/dev/null; then
+        warn "Container $ct does not exist. Skipping."
+        return 1
+    fi
+    return 0
+}
+
 
 check_container_version() {
     local ct=$1
@@ -251,12 +261,14 @@ update_host
 
 # Process containers that WILL be rebooted
 for ct in "${CONTAINERS_REBOOT[@]}"; do
+    validate_container "$ct" || continue
     os_type=$(pct exec "$ct" -- cat /etc/os-release | grep "^ID=" | cut -d= -f2 | tr -d '"')
     update_container "$ct" "$os_type" "true"
 done
 
 # Process containers that will NOT be rebooted (staging)
 for ct in "${CONTAINERS_STAGING[@]}"; do
+    validate_container "$ct" || continue
     os_type=$(pct exec "$ct" -- cat /etc/os-release | grep "^ID=" | cut -d= -f2 | tr -d '"')
     update_container "$ct" "$os_type" "false"
 done

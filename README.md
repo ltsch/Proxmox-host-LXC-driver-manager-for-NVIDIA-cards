@@ -13,6 +13,9 @@ NVML library version: 590.44
 
 Manually keeping multiple containers in sync with the host is tedious and error-prone. This script automates the process.
 
+> [!NOTE]
+> Full disclosure: This project contains some AI-written code because I am not a very good developer. I have reviewed the code myself, but transparency is key.
+
 ## Features
 
 - **Idempotent**: Safely re-run anytime - skips containers already at target version
