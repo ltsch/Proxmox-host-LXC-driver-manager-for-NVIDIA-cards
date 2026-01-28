@@ -16,13 +16,13 @@ TARGET_VERSION="${TARGET_VERSION:-590.48}"
 # CONTAINERS_REBOOT: These containers will be rebooted after driver update.
 #                    Use for containers that can tolerate brief downtime.
 #                    Example: Tdarr (if you can pause transcoding)
-CONTAINERS_REBOOT=(101 102)
+CONTAINERS_REBOOT=(100)
 
 # CONTAINERS_STAGING: These containers will NOT be rebooted automatically.
 #                     Changes are staged and apply on next manual restart.
 #                     Use for 24/7 services where you control the restart window.
 #                     Example: Plex, Jellyfin (if always streaming)
-CONTAINERS_STAGING=(103)
+CONTAINERS_STAGING=()
 
 # !Do not list the same container in both arrays! 
 
@@ -131,8 +131,85 @@ Pin-Priority: 1001
 EOF\""
 }
 
+configure_nvidia_repo() {
+    local ct=$1
+    local os_type=$2
+    
+    # Check if NVIDIA repo is already configured
+    if pct exec "$ct" -- bash -c "apt-cache policy | grep -q 'developer.download.nvidia.com'"; then
+        log "NVIDIA repository already configured in container $ct"
+        return 0
+    fi
+    
+    log "Adding NVIDIA CUDA repository to container $ct ($os_type)..."
+    
+    if [[ "$os_type" == "ubuntu" ]]; then
+        # Ubuntu 24.04
+        run_cmd "pct exec $ct -- bash -c 'wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb -O /tmp/cuda-keyring.deb'"
+        run_cmd "pct exec $ct -- dpkg -i /tmp/cuda-keyring.deb"
+        run_cmd "pct exec $ct -- rm -f /tmp/cuda-keyring.deb"
+    else
+        # Debian 12/13
+        local debian_version
+        debian_version=$(pct exec "$ct" -- bash -c "grep VERSION_ID /etc/os-release | cut -d= -f2 | tr -d '\"'")
+        
+        if [[ "$debian_version" == "12" ]]; then
+            run_cmd "pct exec $ct -- bash -c 'wget -q https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb -O /tmp/cuda-keyring.deb'"
+        elif [[ "$debian_version" == "13" ]]; then
+            run_cmd "pct exec $ct -- bash -c 'wget -q https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/cuda-keyring_1.1-1_all.deb -O /tmp/cuda-keyring.deb'"
+        else
+            warn "Unsupported Debian version: $debian_version. Skipping repo configuration."
+            return 1
+        fi
+        
+        run_cmd "pct exec $ct -- dpkg -i /tmp/cuda-keyring.deb"
+        run_cmd "pct exec $ct -- rm -f /tmp/cuda-keyring.deb"
+    fi
+    
+    success "NVIDIA repository configured in container $ct"
+}
+
+configure_host_nvidia_repo() {
+    # Check if NVIDIA repo is already configured
+    if apt-cache policy | grep -q 'developer.download.nvidia.com'; then
+        log "NVIDIA repository already configured on host"
+        return 0
+    fi
+    
+    log "Adding NVIDIA CUDA repository to host..."
+    
+    # Host is assumed to be Debian (Proxmox)
+    local debian_version
+    if [ -f /etc/os-release ]; then
+        debian_version=$(grep VERSION_ID /etc/os-release | cut -d= -f2 | tr -d '"')
+    else
+        warn "Could not detect OS version on host. Skipping repo configuration."
+        return 1
+    fi
+    
+    if [[ "$debian_version" == "12" ]]; then
+        run_cmd "wget -q https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb -O /tmp/cuda-keyring.deb"
+    elif [[ "$debian_version" == "13" ]]; then
+        run_cmd "wget -q https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/cuda-keyring_1.1-1_all.deb -O /tmp/cuda-keyring.deb"
+    else
+        warn "Unsupported Debian version on host: $debian_version. Skipping repo configuration."
+        return 1
+    fi
+    
+    run_cmd "dpkg -i /tmp/cuda-keyring.deb"
+    run_cmd "rm -f /tmp/cuda-keyring.deb"
+    
+    success "NVIDIA repository configured on host"
+}
+
 update_host() {
     log "--- Starting Host Upgrade ($TARGET_VERSION) ---"
+
+    # Ensure Repo is present
+    configure_host_nvidia_repo
+
+    # Ensure Nouveau is blacklisted (Policy)
+    blacklist_nouveau
     
     # Check if already at target version
     if dkms status | grep -q "nvidia/${TARGET_VERSION}.*installed"; then
@@ -152,13 +229,17 @@ update_host() {
     run_cmd "apt-mark unhold ${HOST_PACKAGES[*]} libnvidia* &>/dev/null || true"
     run_cmd "apt-get update"
     
+    # Install Headers (unpinned)
+    run_cmd "DEBIAN_FRONTEND=noninteractive apt-get install -y proxmox-default-headers"
+
     # Install
     local install_args=""
     for pkg in "${HOST_PACKAGES[@]}"; do
         install_args="$install_args $pkg=${TARGET_VERSION}*"
     done
     
-    run_cmd "DEBIAN_FRONTEND=noninteractive apt-get install -y $install_args"
+    # We must force reinstall to trigger DKMS build if it failed previously (e.g. missing headers)
+    run_cmd "DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall $install_args"
 
     # Post-Install Config
     log "Configuring Host..."
@@ -166,9 +247,19 @@ update_host() {
     run_cmd "systemctl disable --now display-manager service 2>/dev/null || true"
     run_cmd "systemctl mask display-manager service 2>/dev/null || true"
 
+    # Blacklist Nouveau
+    blacklist_nouveau
+
     # Reload Driver if needed
-    if ! nvidia-smi | grep -q "$TARGET_VERSION"; then
+    if ! grep -q "$TARGET_VERSION" /proc/driver/nvidia/version 2>/dev/null; then
        log "Reloading NVIDIA modules..."
+       
+       # Unload Nouveau if present (prevents NVIDIA load)
+       if lsmod | grep -q nouveau; then
+           warn "Nouveau driver is loaded. Attempting to unload..."
+           run_cmd "modprobe -r nouveau || true"
+       fi
+       
        run_cmd "modprobe -r nvidia_uvm nvidia_drm nvidia_modeset nvidia || true"
        run_cmd "modprobe nvidia"
     fi
@@ -179,18 +270,30 @@ update_host() {
     success "Host Configured."
 }
 
+blacklist_nouveau() {
+    local ct=$1
+    local config_content="blacklist nouveau\noptions nouveau modeset=0"
+    
+    if [[ -z "$ct" ]]; then
+        # Host
+        log "Blacklisting nouveau on host..."
+        run_cmd "echo -e '$config_content' > /etc/modprobe.d/blacklist-nouveau.conf"
+        # We might need to update initramfs, but that's slow. 
+        # The user just wants it blacklisted so it doesn't load.
+        # Ensure it's not loaded now is handled in reload block.
+    else
+        # Container
+        log "Blacklisting nouveau in container $ct..."
+        run_cmd "pct exec $ct -- bash -c \"echo -e '$config_content' > /etc/modprobe.d/blacklist-nouveau.conf\""
+    fi
+}
+
 update_container() {
     local ct=$1
     local os_type=$2
     local reboot_required=$3
     
     log "--- Updating Container $ct ($os_type) ---"
-    
-    # 0. Pre-check Version
-    if check_container_version "$ct" "$os_type"; then
-        success "Container $ct is already at target version ($TARGET_VERSION). Skipping update."
-        return
-    fi
     
     # 1. Determine Packages
     local pkgs=()
@@ -200,11 +303,26 @@ update_container() {
         pkgs=("${DEBIAN_PACKAGES[@]}")
     fi
     
-    # 2. Check State
+    # 2. Check State & Ensure Running
     if ! pct status $ct | grep -q "running"; then
         log "Starting container $ct..."
         run_cmd "pct start $ct"
+        # In dry run, we won't actually be running, so subsequent execs would fail if not guarded or if we don't return.
+        # However, for check_container_version, we need to know if we should check.
+        if [[ "$DRY_RUN" == "true" ]]; then
+             warn "Dry Run: Container $ct is stopped. Start command skipped. Skipping version check/install simulation for this container to avoid errors."
+             return
+        fi
         sleep 5
+    fi
+
+    # Blacklist Nouveau (Host-mandated policy)
+    blacklist_nouveau "$ct"
+
+    # 0. Pre-check Version
+    if check_container_version "$ct" "$os_type"; then
+        success "Container $ct is already at target version ($TARGET_VERSION). Skipping update."
+        return
     fi
 
     # 3. Install
@@ -215,7 +333,10 @@ update_container() {
         hold_str="$hold_str $pkg"
     done
     
-    # 2.5 Configure Pinning (Debian only for now, based on observed needs)
+    # 2.5 Configure NVIDIA Repository
+    configure_nvidia_repo "$ct" "$os_type"
+    
+    # 2.6 Configure Pinning (Debian only for now, based on observed needs)
     if [[ "$os_type" != "ubuntu" ]]; then
         configure_repo_pinning "$ct"
     fi
@@ -235,8 +356,8 @@ update_container() {
     
     # 5. Handle Restart
     if [[ "$reboot_required" == "true" ]]; then
-        log "Rebooting container $ct to apply changes..."
-        run_cmd "pct reboot $ct"
+        log "Restarting container $ct to apply changes..."
+        run_cmd "pct stop $ct && sleep 2 && pct start $ct"
     else
         warn "Container $ct NOT rebooted. Driver changes will apply on next restart."
     fi
