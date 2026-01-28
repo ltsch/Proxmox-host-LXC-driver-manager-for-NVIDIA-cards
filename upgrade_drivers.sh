@@ -16,13 +16,13 @@ TARGET_VERSION="${TARGET_VERSION:-590.48}"
 # CONTAINERS_REBOOT: These containers will be rebooted after driver update.
 #                    Use for containers that can tolerate brief downtime.
 #                    Example: Tdarr (if you can pause transcoding)
-CONTAINERS_REBOOT=(100)
+CONTAINERS_REBOOT=(107)
 
 # CONTAINERS_STAGING: These containers will NOT be rebooted automatically.
 #                     Changes are staged and apply on next manual restart.
 #                     Use for 24/7 services where you control the restart window.
 #                     Example: Plex, Jellyfin (if always streaming)
-CONTAINERS_STAGING=()
+CONTAINERS_STAGING=(105 100)
 
 # !Do not list the same container in both arrays! 
 
@@ -31,6 +31,7 @@ HOST_PACKAGES=(
     "nvidia-driver"
     "firmware-nvidia-gsp"
     "nvidia-kernel-dkms"
+    "nvidia-persistenced"
 )
 
 # Container Package Mapping
@@ -119,6 +120,75 @@ cleanup_orphan_files() {
     run_cmd "pct exec $ct -- ldconfig"
 }
 
+ensure_device_nodes() {
+    # On headless Proxmox, NVIDIA device nodes are not created automatically.
+    # The udev rule only fires when the character device is registered,
+    # but that requires something to call nvidia-modprobe first.
+    # This function ensures device nodes exist via:
+    # 1. A systemd service that runs nvidia-modprobe at boot
+    # 2. nvidia-persistenced (installed as part of HOST_PACKAGES)
+    
+    local service_file="/etc/systemd/system/nvidia-dev-nodes.service"
+    
+    if [[ ! -f "$service_file" ]]; then
+        log "Creating systemd service to ensure NVIDIA device nodes at boot..."
+        run_cmd "cat <<'EOF' > $service_file
+[Unit]
+Description=Create NVIDIA device nodes
+After=systemd-modules-load.service
+Before=nvidia-persistenced.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/nvidia-modprobe -c 0 -u
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF"
+        run_cmd "systemctl daemon-reload"
+        run_cmd "systemctl enable nvidia-dev-nodes.service"
+        success "Created and enabled nvidia-dev-nodes.service"
+    fi
+    
+    # Ensure nvidia-persistenced is enabled
+    if systemctl list-unit-files | grep -q nvidia-persistenced; then
+        run_cmd "systemctl enable nvidia-persistenced.service 2>/dev/null || true"
+    fi
+    
+    # Create nodes now if missing
+    if [[ ! -e /dev/nvidia0 ]]; then
+        log "Creating NVIDIA device nodes now..."
+        run_cmd "/usr/bin/nvidia-modprobe -c 0 -u || true"
+        # Also create nvidiactl and nvidia-modeset if nvidia-modprobe didn't
+        if [[ ! -e /dev/nvidiactl ]]; then
+            run_cmd "mknod -m 666 /dev/nvidiactl c 195 255 2>/dev/null || true"
+        fi
+        if [[ ! -e /dev/nvidia-modeset ]]; then
+            run_cmd "modprobe nvidia_modeset 2>/dev/null || true"
+            run_cmd "mknod -m 666 /dev/nvidia-modeset c 195 254 2>/dev/null || true"
+        fi
+        if [[ ! -d /dev/nvidia-caps ]]; then
+            run_cmd "mkdir -p /dev/nvidia-caps"
+            local caps_major
+            caps_major=$(awk '/nvidia-caps$/ {print $1}' /proc/devices 2>/dev/null)
+            if [[ -n "$caps_major" ]]; then
+                run_cmd "mknod -m 666 /dev/nvidia-caps/nvidia-cap1 c $caps_major 1 2>/dev/null || true"
+                run_cmd "mknod -m 666 /dev/nvidia-caps/nvidia-cap2 c $caps_major 2 2>/dev/null || true"
+            else
+                 warn "Could not determine nvidia-caps major number. Skipping creation."
+            fi
+        fi
+    fi
+    
+    # Verify
+    if [[ -e /dev/nvidia0 ]] && [[ -e /dev/nvidiactl ]]; then
+        success "NVIDIA device nodes verified: $(ls /dev/nvidia* 2>/dev/null | tr '\n' ' ')"
+    else
+        warn "Some NVIDIA device nodes may still be missing. Check /dev/nvidia*"
+    fi
+}
+
 # --- Main Functions -----------------------------------------------------------
 
 configure_repo_pinning() {
@@ -135,36 +205,62 @@ configure_nvidia_repo() {
     local ct=$1
     local os_type=$2
     
-    # Check if NVIDIA repo is already configured
-    if pct exec "$ct" -- bash -c "apt-cache policy | grep -q 'developer.download.nvidia.com'"; then
-        log "NVIDIA repository already configured in container $ct"
+    # Detect Version First
+    local dist_version=""
+    local expected_repo_part=""
+    
+    if [[ "$os_type" == "ubuntu" ]]; then
+        dist_version=$(pct exec "$ct" -- bash -c "grep VERSION_ID /etc/os-release | cut -d= -f2 | tr -d '\"'")
+        if [[ "$dist_version" == "22.04" ]]; then
+            expected_repo_part="ubuntu2204"
+        elif [[ "$dist_version" == "24.04" ]]; then
+            expected_repo_part="ubuntu2404"
+        else
+            warn "Unsupported Ubuntu version in $ct: $dist_version. Skipping repo configuration."
+            return 1
+        fi
+    elif [[ "$os_type" == "debian" ]]; then # Explicitly check debian, though script passes it as such? No, script passes what it finds.
+        # The script calls it by the ID needed. The caller passes 'debian' usually? 
+        # Wait, caller uses: os_type=$(pct exec "$ct" -- cat /etc/os-release | grep "^ID=" | cut -d= -f2 | tr -d '"')
+        # So os_type is 'debian' or 'ubuntu'.
+        
+        dist_version=$(pct exec "$ct" -- bash -c "grep VERSION_ID /etc/os-release | cut -d= -f2 | tr -d '\"'")
+        if [[ "$dist_version" == "12" ]]; then
+            expected_repo_part="debian12"
+        elif [[ "$dist_version" == "13" ]]; then
+            expected_repo_part="debian13"
+        else
+             warn "Unsupported Debian version in $ct: $dist_version. Skipping repo configuration."
+             return 1
+        fi
+    fi
+
+    # Check if CORRECT NVIDIA repo is already configured
+    # We grep for the specific expected part (e.g., ubuntu2404) to catch mismatches
+    if pct exec "$ct" -- bash -c "apt-cache policy | grep 'developer.download.nvidia.com' | grep -q '$expected_repo_part'"; then
+        log "Correct NVIDIA repository ($expected_repo_part) already configured in container $ct"
         return 0
     fi
     
-    log "Adding NVIDIA CUDA repository to container $ct ($os_type)..."
-    
-    if [[ "$os_type" == "ubuntu" ]]; then
-        # Ubuntu 24.04
-        run_cmd "pct exec $ct -- bash -c 'wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb -O /tmp/cuda-keyring.deb'"
-        run_cmd "pct exec $ct -- dpkg -i /tmp/cuda-keyring.deb"
-        run_cmd "pct exec $ct -- rm -f /tmp/cuda-keyring.deb"
-    else
-        # Debian 12/13
-        local debian_version
-        debian_version=$(pct exec "$ct" -- bash -c "grep VERSION_ID /etc/os-release | cut -d= -f2 | tr -d '\"'")
-        
-        if [[ "$debian_version" == "12" ]]; then
-            run_cmd "pct exec $ct -- bash -c 'wget -q https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb -O /tmp/cuda-keyring.deb'"
-        elif [[ "$debian_version" == "13" ]]; then
-            run_cmd "pct exec $ct -- bash -c 'wget -q https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/cuda-keyring_1.1-1_all.deb -O /tmp/cuda-keyring.deb'"
-        else
-            warn "Unsupported Debian version: $debian_version. Skipping repo configuration."
-            return 1
-        fi
-        
-        run_cmd "pct exec $ct -- dpkg -i /tmp/cuda-keyring.deb"
-        run_cmd "pct exec $ct -- rm -f /tmp/cuda-keyring.deb"
+    # If we are here, either no repo is configured, OR the WRONG repo is configured.
+    # We should continue to install the correct keyring.
+    # Ideally, we should remove the wrong one if it exists, but dpkg -i cuda-keyring might handle it 
+    # if the package name is the same. 
+    # However, if the keyring package puts files with different names (cuda-ubuntu2404.list vs cuda-ubuntu2204.list),
+    # we might end up with duplicate execution.
+    # Let's try to remove old list files if we suspect a mismatch.
+    if pct exec "$ct" -- bash -c "ls /etc/apt/sources.list.d/cuda*.list &>/dev/null"; then
+         log "Cleaning up existing CUDA repo files in $ct to prevent conflicts..."
+         run_cmd "pct exec $ct -- rm -f /etc/apt/sources.list.d/cuda*.list"
     fi
+
+    log "Adding NVIDIA CUDA repository to container $ct ($os_type $dist_version)..."
+    
+    local keyring_url="https://developer.download.nvidia.com/compute/cuda/repos/${expected_repo_part}/x86_64/cuda-keyring_1.1-1_all.deb"
+    
+    run_cmd "pct exec $ct -- bash -c 'wget -q $keyring_url -O /tmp/cuda-keyring.deb'"
+    run_cmd "pct exec $ct -- dpkg -i /tmp/cuda-keyring.deb"
+    run_cmd "pct exec $ct -- rm -f /tmp/cuda-keyring.deb"
     
     success "NVIDIA repository configured in container $ct"
 }
@@ -267,26 +363,34 @@ update_host() {
     # Pin Packages
     run_cmd "apt-mark hold ${HOST_PACKAGES[*]}"
     
+    # Ensure device nodes are created (critical for headless servers)
+    ensure_device_nodes
+    
     success "Host Configured."
 }
 
 blacklist_nouveau() {
     local ct=$1
     local config_content="blacklist nouveau\noptions nouveau modeset=0"
+    local blacklist_file="/etc/modprobe.d/blacklist-nouveau.conf"
     
     if [[ -z "$ct" ]]; then
         # Host
+        if [[ -f "$blacklist_file" ]]; then
+            return 0  # Already blacklisted, skip silently
+        fi
         log "Blacklisting nouveau on host..."
-        run_cmd "echo -e '$config_content' > /etc/modprobe.d/blacklist-nouveau.conf"
-        # We might need to update initramfs, but that's slow. 
-        # The user just wants it blacklisted so it doesn't load.
-        # Ensure it's not loaded now is handled in reload block.
+        run_cmd "echo -e '$config_content' > $blacklist_file"
     else
         # Container
+        if pct exec "$ct" -- test -f "$blacklist_file" 2>/dev/null; then
+            return 0  # Already blacklisted, skip silently
+        fi
         log "Blacklisting nouveau in container $ct..."
-        run_cmd "pct exec $ct -- bash -c \"echo -e '$config_content' > /etc/modprobe.d/blacklist-nouveau.conf\""
+        run_cmd "pct exec $ct -- bash -c \"echo -e '$config_content' > $blacklist_file\""
     fi
 }
+
 
 update_container() {
     local ct=$1
