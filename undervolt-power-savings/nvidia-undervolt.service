@@ -1,0 +1,12 @@
+[Unit]
+Description=NVIDIA GPU Undervolt & Optimization
+After=network.target nvidia-persistenced.service
+
+[Service]
+Type=oneshot
+# Path will be replaced by install script
+ExecStart=%PATH%/venv/bin/python3 %PATH%/undervolt.py
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -22,7 +22,7 @@ CONTAINERS_REBOOT=(107)
 #                     Changes are staged and apply on next manual restart.
 #                     Use for 24/7 services where you control the restart window.
 #                     Example: Plex, Jellyfin (if always streaming)
-CONTAINERS_STAGING=(105 100)
+CONTAINERS_STAGING=(105 100 108)
 
 # !Do not list the same container in both arrays! 
 
@@ -186,6 +186,28 @@ EOF"
         success "NVIDIA device nodes verified: $(ls /dev/nvidia* 2>/dev/null | tr '\n' ' ')"
     else
         warn "Some NVIDIA device nodes may still be missing. Check /dev/nvidia*"
+    fi
+}
+
+ensure_nvidia_smi() {
+    # On some systems (Proxmox/Debian with certain repos), nvidia-smi package is empty/missing binary.
+    # We copy it from a container that has it (e.g. Ubuntu container with full driver).
+    if ! command -v nvidia-smi &>/dev/null || [[ ! -s $(command -v nvidia-smi) ]]; then
+        log "nvidia-smi binary missing or empty on host. Attempting to copy from containers..."
+        # Try finding in containers
+        for ct in "${CONTAINERS_STAGING[@]}" "${CONTAINERS_REBOOT[@]}"; do
+             # Check if container is running or at least mountable/readable
+             # We use the rootfs path directly for reliability
+             local smi_path="/var/lib/lxc/$ct/rootfs/usr/bin/nvidia-smi"
+             if [[ -f "$smi_path" ]] && [[ -s "$smi_path" ]]; then
+                 log "Found nvidia-smi in container $ct ($smi_path). Copying..."
+                 run_cmd "cp $smi_path /usr/bin/nvidia-smi"
+                 run_cmd "chmod +x /usr/bin/nvidia-smi"
+                 success "nvidia-smi restored from $ct"
+                 return 0
+             fi
+        done
+        warn "Could not find nvidia-smi in any container. The nvidia-smi binary will not be available on the host."
     fi
 }
 
@@ -365,6 +387,9 @@ update_host() {
     
     # Ensure device nodes are created (critical for headless servers)
     ensure_device_nodes
+    
+    # Ensure nvidia-smi is present
+    ensure_nvidia_smi
     
     success "Host Configured."
 }

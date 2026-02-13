@@ -32,6 +32,13 @@ Manually keeping multiple containers in sync with the host is tedious and error-
 - LXC containers with GPU passthrough configured
 - NVIDIA CUDA repository configured in containers
 - Root access on the Proxmox host
+- NVIDIA RTX 3090/4090 (for undervolting features)
+
+## GPU Optimization (Undervolt)
+
+This repository includes a standalone tool for **headless GPU undervolting** and power management (Clock Lock + Power Limit).
+
+👉 **[See undervolt-power-savings/README.md](undervolt-power-savings/README.md)** for details.
 
 ## Quick Start
 
