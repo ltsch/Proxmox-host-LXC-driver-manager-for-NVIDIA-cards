@@ -52,6 +52,9 @@ DEBIAN_PACKAGES=(
     "libnvcuvid1"
     "libnvidia-ml1"
 )
+# Regex: dpkg ${binary:Package} lines (name or name:arch). Prefix must be followed by rest of name, not only ":".
+NVIDIA_DPKG_GREP='^(nvidia|firmware-nvidia|libnvidia|libegl-nvidia|libgles-nvidia|libglx-nvidia|xserver-xorg-video-nvidia)[^:]*(:.*)?$'
+
 # ------------------------------------------------------------------------------
 
 set -e
@@ -82,6 +85,53 @@ run_cmd() {
     else
         eval "$cmd"
     fi
+}
+
+# Newline-separated binary:Package names for installed NVIDIA stack packages on this host.
+host_nvidia_stack_packages() {
+    dpkg-query -W -f='${binary:Package}\n' 2>/dev/null | grep -E "$NVIDIA_DPKG_GREP" || true
+}
+
+unhold_host_nvidia_stack() {
+    local pkgs
+    pkgs=$(host_nvidia_stack_packages | tr '\n' ' ')
+    if [[ -n "$pkgs" ]]; then
+        run_cmd "apt-mark unhold $pkgs &>/dev/null || true"
+    fi
+}
+
+hold_host_nvidia_stack() {
+    local pkgs
+    pkgs=$(host_nvidia_stack_packages | tr '\n' ' ')
+    # Always hold configured driver metapackages even if dpkg list is empty (edge case).
+    run_cmd "apt-mark hold ${HOST_PACKAGES[*]} $pkgs &>/dev/null || true"
+}
+
+# Unhold all installed NVIDIA stack packages in an LXC (dpkg list on host side + grep).
+container_unhold_nvidia_stack() {
+    local ct=$1
+    local pkgs
+    pkgs=$(pct exec "$ct" -- dpkg-query -W -f '${binary:Package}\n' 2>/dev/null | grep -E "$NVIDIA_DPKG_GREP" | tr '\n' ' ' || true)
+    if [[ -n "$pkgs" ]]; then
+        run_cmd "pct exec $ct -- apt-mark unhold $pkgs &>/dev/null || true"
+    fi
+}
+
+ensure_container_holds() {
+    local ct=$1
+    local os_type=$2
+    local pkgs=()
+    if [[ "$os_type" == "ubuntu" ]]; then
+        pkgs=("${UBUNTU_PACKAGES[@]}")
+    else
+        pkgs=("${DEBIAN_PACKAGES[@]}")
+    fi
+    local hold_str=""
+    for pkg in "${pkgs[@]}"; do
+        hold_str="$hold_str $pkg"
+    done
+    [[ -z "$hold_str" ]] && return 0
+    run_cmd "pct exec $ct -- apt-mark hold $hold_str &>/dev/null || true"
 }
 
 validate_container() {
@@ -329,9 +379,13 @@ update_host() {
     # Ensure Nouveau is blacklisted (Policy)
     blacklist_nouveau
     
-    # Check if already at target version
+    # Check if already at target version — still apply holds and post-steps (early return used to skip holds).
     if dkms status | grep -q "nvidia/${TARGET_VERSION}.*installed"; then
-        success "Host is already at target version ($TARGET_VERSION). Skipping update."
+        success "Host is already at target version ($TARGET_VERSION). Skipping driver reinstall."
+        log "Applying package holds so apt upgrade cannot drift the NVIDIA stack..."
+        hold_host_nvidia_stack
+        ensure_device_nodes
+        ensure_nvidia_smi
         return
     fi
 
@@ -343,8 +397,9 @@ update_host() {
     done
 
     log "Installing Host Packages..."
-    # Unhold first
-    run_cmd "apt-mark unhold ${HOST_PACKAGES[*]} libnvidia* &>/dev/null || true"
+    # Unhold stack (shell globs like libnvidia* do not match APT package names)
+    unhold_host_nvidia_stack
+    run_cmd "apt-mark unhold ${HOST_PACKAGES[*]} &>/dev/null || true"
     run_cmd "apt-get update"
     
     # Install Headers (unpinned)
@@ -382,8 +437,7 @@ update_host() {
        run_cmd "modprobe nvidia"
     fi
 
-    # Pin Packages
-    run_cmd "apt-mark hold ${HOST_PACKAGES[*]}"
+    hold_host_nvidia_stack
     
     # Ensure device nodes are created (critical for headless servers)
     ensure_device_nodes
@@ -448,9 +502,10 @@ update_container() {
     # Blacklist Nouveau (Host-mandated policy)
     blacklist_nouveau "$ct"
 
-    # 0. Pre-check Version
+    # 0. Pre-check Version (still (re)apply holds — same bug as host used to skip them here)
     if check_container_version "$ct" "$os_type"; then
-        success "Container $ct is already at target version ($TARGET_VERSION). Skipping update."
+        success "Container $ct is already at target version ($TARGET_VERSION). Skipping install."
+        ensure_container_holds "$ct" "$os_type"
         return
     fi
 
@@ -472,7 +527,8 @@ update_container() {
 
     log "Installing packages in $ct..."
     cleanup_orphan_files "$ct"
-    run_cmd "pct exec $ct -- bash -c 'apt-mark unhold nvidia* libnvidia* &>/dev/null || true; apt-get update'"
+    container_unhold_nvidia_stack "$ct"
+    run_cmd "pct exec $ct -- apt-get update"
     run_cmd "pct exec $ct -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall --allow-change-held-packages --no-install-recommends $install_str'"
     
     # 4. Pin

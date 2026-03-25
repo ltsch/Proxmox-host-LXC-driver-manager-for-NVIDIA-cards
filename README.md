@@ -18,13 +18,14 @@ Manually keeping multiple containers in sync with the host is tedious and error-
 
 ## Features
 
-- **Idempotent**: Safely re-run anytime - skips containers already at target version
+- **Idempotent**: Safely re-run anytime — skips reinstall when DKMS already matches `TARGET_VERSION`, but **still reapplies holds** on the host and in containers
 - **File-Based Validation**: Checks actual `.so` files exist (not just package DB)
 - **Orphan Cleanup**: Removes leftover library files from previous versions
 - **Forced Reinstall**: Fixes corrupted/partial installs automatically
-- **Dry-Run Mode**: Preview changes before applying
+- **Dry-Run Mode**: Prints `apt-mark` / `pct exec` commands it would run (see note below)
 - **OS-Aware**: Handles Ubuntu and Debian package naming differences
-- **APT Pinning**: Locks packages to prevent version drift
+- **Version lock (host)**: `apt-mark hold` on **`HOST_PACKAGES` plus every installed proprietary NVIDIA stack package** reported by `dpkg` (so `apt upgrade` does not drift the driver userland)
+- **Containers (Debian)**: Optional `preferences.d` entry favoring packages from `developer.download.nvidia.com`; **managed packages** are held with `apt-mark hold` after install
 
 ## Requirements
 
@@ -91,7 +92,15 @@ The script auto-detects OS and uses the correct packages:
 | Distro | Packages |
 |--------|----------|
 | Ubuntu 24.04 | `libnvidia-compute`, `libnvidia-encode`, `libnvidia-decode`, `libnvidia-gl` |
-| Debian 12/13 | `libcuda1`, `libnvcuvid1`, `libnvidia-encode1`, `libnvidia-ml1` |
+| Debian 12/13 | `libcuda1`, `libnvidia-encode1`, `libnvcuvid1`, `libnvidia-ml1` |
+
+### Dry-run (`--dry-run`)
+
+Commands passed through `run_cmd` (e.g. `apt-mark hold`, `pct exec …`) are **only printed**, not executed. **Host-side helpers** such as `ensure_device_nodes()` and `ensure_nvidia_smi()` still touch the system when run as root — use dry-run from a throwaway shell if you need a pure preview.
+
+### `apt list --upgradable` vs holds
+
+Newer driver versions may still **appear** in `apt list --upgradable` while packages are **on hold**. What matters is that **`apt upgrade`** does not install them. Verify with `apt-mark showhold` and `apt -s upgrade` if unsure.
 
 ## Troubleshooting
 
@@ -129,14 +138,28 @@ pct exec <CT_ID> -- rm /etc/apt/sources.list.d/<broken-repo>.list
 pct exec <CT_ID> -- apt-get update
 ```
 
+### Host locks up or becomes unusable during `apt upgrade` / kernel install
+
+**Cause**: Installing a **new Proxmox kernel** runs `/etc/kernel/postinst.d/dkms`, which can **rebuild NVIDIA via DKMS** with high parallelism (`make -j$(nproc)`). On a busy node (many VMs/CTs, **heavy swap**), `cc1` can sit in **uninterruptible disk sleep** for a long time and the machine may **appear frozen**.
+
+**Mitigation**:
+
+- Run major upgrades in a **maintenance window**; reduce load (**stop** large guests) and **free RAM** before kernel + NVIDIA builds.
+- After an **unclean shutdown**, boot may run **fsck** on `pve-root` (orphan inode cleanup is normal). Then check: `dpkg --audit` and `DEBIAN_FRONTEND=noninteractive dpkg --configure -a` if nothing else holds the dpkg lock.
+
+### `pct` or UI slow while `dpkg` / DKMS is running
+
+The package database and subsystem load can make **`pct`** and the UI sluggish. That is environmental, not necessarily a dead node.
+
 ## How It Works
 
-1. **Host Check**: Verifies DKMS module matches target version
-2. **Container Check**: Verifies `libnvidia-ml.so.<VERSION>` exists in each container
-3. **Cleanup**: Removes orphaned library files from older versions
-4. **Install**: Runs `apt-get install --reinstall` with version pinning
-5. **Lock**: Holds packages with `apt-mark hold` to prevent drift
-6. **Reboot**: Optionally reboots container to apply changes
+1. **Host**: Ensures NVIDIA CUDA repo exists; if DKMS already has `nvidia/<TARGET_VERSION>` **installed**, skips reinstall but **applies `apt-mark hold`** on the full detected NVIDIA stack (plus `HOST_PACKAGES`) and runs device-node / `nvidia-smi` helpers
+2. **Host (upgrade path)**: Stops listed containers, `apt-get install --reinstall` with `pkg=<TARGET_VERSION>*`, then **holds** the stack again
+3. **Container Check**: Verifies `libnvidia-ml.so.<VERSION>*` exists
+4. **Cleanup**: Removes orphaned library files from older versions
+5. **Container install**: Configures CUDA repo, Debian: `preferences.d` origin pin, `apt-get install --reinstall` with version wildcard, **`apt-mark hold`** on the managed package set
+6. **Container (already at version)**: Skips install but **reapplies holds**
+7. **Reboot**: Optionally stops/starts container to apply changes
 
 ## License
 
