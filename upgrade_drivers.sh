@@ -9,7 +9,7 @@
 # --- Configuration ------------------------------------------------------------
 
 # Target driver version (major.minor, e.g., "590.48" matches "590.48.01")
-TARGET_VERSION="${TARGET_VERSION:-590.48}"
+TARGET_VERSION="${TARGET_VERSION:-615.71}"
 
 # Container Lists
 # ---------------
@@ -141,6 +141,24 @@ validate_container() {
         warn "Container $ct does not exist. Skipping."
         return 1
     fi
+    return 0
+}
+
+# Starts the container if needed so OS detection (pct exec) has something to talk to.
+# Returns 1 if the container could not be brought up (e.g. dry-run on a stopped container),
+# in which case the caller should skip this container for this run.
+ensure_container_running() {
+    local ct=$1
+    if pct status "$ct" | grep -q "running"; then
+        return 0
+    fi
+    log "Starting container $ct..."
+    run_cmd "pct start $ct"
+    if [[ "$DRY_RUN" == "true" ]]; then
+        warn "Dry Run: Container $ct is stopped. Skipping OS detection/update simulation for this container."
+        return 1
+    fi
+    sleep 5
     return 0
 }
 
@@ -401,18 +419,24 @@ update_host() {
     unhold_host_nvidia_stack
     run_cmd "apt-mark unhold ${HOST_PACKAGES[*]} &>/dev/null || true"
     run_cmd "apt-get update"
-    
-    # Install Headers (unpinned)
-    run_cmd "DEBIAN_FRONTEND=noninteractive apt-get install -y proxmox-default-headers"
 
-    # Install
+    # Install/upgrade the NVIDIA stack to TARGET_VERSION *before* touching kernel headers.
+    # proxmox-default-headers can silently pull in a brand-new kernel package as a
+    # dependency; if that happens first, that kernel's postinst triggers a DKMS
+    # autoinstall of the OLD nvidia source against the NEW kernel's headers, which can
+    # fail outright if the kernel's API has moved (e.g. VMA locking changes) — leaving
+    # the kernel package half-configured. Upgrading nvidia first means any later
+    # kernel install builds DKMS against the already-current driver.
     local install_args=""
     for pkg in "${HOST_PACKAGES[@]}"; do
         install_args="$install_args $pkg=${TARGET_VERSION}*"
     done
-    
+
     # We must force reinstall to trigger DKMS build if it failed previously (e.g. missing headers)
     run_cmd "DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall $install_args"
+
+    # Install Headers (unpinned) — safe now that nvidia is already at TARGET_VERSION.
+    run_cmd "DEBIAN_FRONTEND=noninteractive apt-get install -y proxmox-default-headers"
 
     # Post-Install Config
     log "Configuring Host..."
@@ -529,8 +553,23 @@ update_container() {
     cleanup_orphan_files "$ct"
     container_unhold_nvidia_stack "$ct"
     run_cmd "pct exec $ct -- apt-get update"
+
+    # NVIDIA occasionally splits files out of one package into new ones across versions
+    # (e.g. EGL platform libs moving out of libnvidia-gl). dpkg can fail mid-transaction
+    # with "trying to overwrite ... which is also in package X" if the old package hasn't
+    # been fully replaced yet. Self-heal with --fix-broken and retry once rather than
+    # leaving the container in a half-configured state.
+    set +e
     run_cmd "pct exec $ct -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall --allow-change-held-packages --no-install-recommends $install_str'"
-    
+    local install_status=$?
+    set -e
+
+    if [[ $install_status -ne 0 && "$DRY_RUN" != "true" ]]; then
+        warn "Install in $ct failed (possible package-split file conflict) — retrying via 'apt-get install -f'..."
+        run_cmd "pct exec $ct -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get install -f -y'"
+        run_cmd "pct exec $ct -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall --allow-change-held-packages --no-install-recommends $install_str'"
+    fi
+
     # 4. Pin
     run_cmd "pct exec $ct -- apt-mark hold $hold_str"
 
@@ -568,6 +607,7 @@ update_host
 # Process containers that WILL be rebooted
 for ct in "${CONTAINERS_REBOOT[@]}"; do
     validate_container "$ct" || continue
+    ensure_container_running "$ct" || continue
     os_type=$(pct exec "$ct" -- cat /etc/os-release | grep "^ID=" | cut -d= -f2 | tr -d '"')
     update_container "$ct" "$os_type" "true"
 done
@@ -575,6 +615,7 @@ done
 # Process containers that will NOT be rebooted (staging)
 for ct in "${CONTAINERS_STAGING[@]}"; do
     validate_container "$ct" || continue
+    ensure_container_running "$ct" || continue
     os_type=$(pct exec "$ct" -- cat /etc/os-release | grep "^ID=" | cut -d= -f2 | tr -d '"')
     update_container "$ct" "$os_type" "false"
 done
