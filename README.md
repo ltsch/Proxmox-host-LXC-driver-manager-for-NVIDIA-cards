@@ -147,6 +147,12 @@ pct exec <CT_ID> -- apt-get update
 - Run major upgrades in a **maintenance window**; reduce load (**stop** large guests) and **free RAM** before kernel + NVIDIA builds.
 - After an **unclean shutdown**, boot may run **fsck** on `pve-root` (orphan inode cleanup is normal). Then check: `dpkg --audit` and `DEBIAN_FRONTEND=noninteractive dpkg --configure -a` if nothing else holds the dpkg lock.
 
+### DKMS build fails on a new Proxmox kernel: `field 'cxlds' has incomplete type`
+
+**Cause**: Some Proxmox kernels (first seen on **7.0.14-25-pve**) ship a minimal backported `include/cxl/cxl.h` that lacks `struct cxl_dev_state`. NVIDIA's conftest only checks that the header **exists**, so `nv-linux.h` declares `struct nv_cxl` with an incomplete member and the build fails. The kernel package is left half-configured (`dpkg: error processing package proxmox-kernel-…-pve-signed`). Affects at least 615.71.09 and 615.71.10.
+
+**Fix**: The script handles this automatically (`patch_nvidia_cxl_guard` / `repair_nvidia_dkms`): it changes the guard on `struct nv_cxl` to also require `NV_CXL_INIT_SUPPORTED` (the guard the code that uses it already has), keeps the original as `nv-linux.h.orig`, then runs `dpkg --configure -a` and `dkms autoinstall` per kernel. It runs on both the upgrade and the already-at-version paths, so re-running the script after a failed `apt upgrade` repairs it. The patch is skipped once NVIDIA ships a fixed header.
+
 ### `pct` or UI slow while `dpkg` / DKMS is running
 
 The package database and subsystem load can make **`pct`** and the UI sluggish. That is environmental, not necessarily a dead node.
@@ -154,7 +160,7 @@ The package database and subsystem load can make **`pct`** and the UI sluggish. 
 ## How It Works
 
 1. **Host**: Ensures NVIDIA CUDA repo exists; if DKMS already has `nvidia/<TARGET_VERSION>` **installed**, skips reinstall but **applies `apt-mark hold`** on the full detected NVIDIA stack (plus `HOST_PACKAGES`) and runs device-node / `nvidia-smi` helpers
-2. **Host (upgrade path)**: Stops listed containers, `apt-get install --reinstall` with `pkg=<TARGET_VERSION>*`, then **holds** the stack again
+2. **Host (upgrade path)**: Stops listed containers, `apt-get install --reinstall` with `pkg=<TARGET_VERSION>*`, applies the DKMS source workaround if needed (see CXL troubleshooting above), then **holds** the stack again
 3. **Container Check**: Verifies `libnvidia-ml.so.<VERSION>*` exists
 4. **Cleanup**: Removes orphaned library files from older versions
 5. **Container install**: Configures CUDA repo, Debian: `preferences.d` origin pin, `apt-get install --reinstall` with version wildcard, **`apt-mark hold`** on the managed package set

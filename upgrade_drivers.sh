@@ -388,6 +388,41 @@ configure_host_nvidia_repo() {
     success "NVIDIA repository configured on host"
 }
 
+# Workaround: some Proxmox kernels (e.g. 7.0.14-25-pve) ship a minimal include/cxl/cxl.h
+# backport without struct cxl_dev_state. NVIDIA's conftest only checks that the header
+# exists, so nv-linux.h declares struct nv_cxl with an incomplete member and every file
+# fails with "field 'cxlds' has incomplete type". The code using nv_cxl is already guarded
+# by NV_CXL_INIT_SUPPORTED, so require that for the declaration too. Idempotent; no-op once
+# NVIDIA ships a fixed header. Returns 0 if any source tree was patched.
+patch_nvidia_cxl_guard() {
+    local hdr patched=1
+    for hdr in /usr/src/nvidia-*/kernel-open/common/inc/nv-linux.h /usr/src/nvidia-*/common/inc/nv-linux.h; do
+        [[ -f "$hdr" ]] || continue
+        # Only patch when the unguarded '#if' sits directly above 'struct nv_cxl {'
+        grep -Pzq '#if defined\(NV_CXL_CXL_H_PRESENT\)\nstruct nv_cxl \{' "$hdr" || continue
+        warn "Patching CXL guard in $hdr (Proxmox kernel cxl.h backport workaround)"
+        [[ -f "$hdr.orig" ]] || run_cmd "cp '$hdr' '$hdr.orig'"
+        run_cmd "sed -i '/^#if defined(NV_CXL_CXL_H_PRESENT)\$/{N;s/^#if defined(NV_CXL_CXL_H_PRESENT)\nstruct nv_cxl {/#if defined(NV_CXL_CXL_H_PRESENT) \&\& defined(NV_CXL_INIT_SUPPORTED)\nstruct nv_cxl {/}' '$hdr'"
+        patched=0
+    done
+    return $patched
+}
+
+# Patch the NVIDIA DKMS source if needed, then finish any package (driver or kernel)
+# whose postinst failed on the DKMS build and build the module for all installed kernels.
+repair_nvidia_dkms() {
+    patch_nvidia_cxl_guard || true
+    if [[ -n "$(dpkg --audit 2>/dev/null)" ]]; then
+        log "Completing half-configured packages..."
+        run_cmd "DEBIAN_FRONTEND=noninteractive dpkg --configure -a"
+    fi
+    local kdir
+    for kdir in /lib/modules/*/build; do
+        [[ -e "$kdir" ]] || continue
+        run_cmd "dkms autoinstall -k '$(basename "$(dirname "$kdir")")' || warn 'DKMS autoinstall failed for $(basename "$(dirname "$kdir")")'"
+    done
+}
+
 update_host() {
     log "--- Starting Host Upgrade ($TARGET_VERSION) ---"
 
@@ -400,6 +435,7 @@ update_host() {
     # Check if already at target version — still apply holds and post-steps (early return used to skip holds).
     if dkms status | grep -q "nvidia/${TARGET_VERSION}.*installed"; then
         success "Host is already at target version ($TARGET_VERSION). Skipping driver reinstall."
+        repair_nvidia_dkms
         log "Applying package holds so apt upgrade cannot drift the NVIDIA stack..."
         hold_host_nvidia_stack
         ensure_device_nodes
@@ -433,10 +469,16 @@ update_host() {
     done
 
     # We must force reinstall to trigger DKMS build if it failed previously (e.g. missing headers)
-    run_cmd "DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall $install_args"
+    # The DKMS build in the postinst can fail before the source is patched (see
+    # patch_nvidia_cxl_guard), so tolerate that here and let repair_nvidia_dkms finish it.
+    run_cmd "DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall $install_args" \
+        || warn "Driver install reported errors; patching DKMS source and retrying configuration..."
+    repair_nvidia_dkms
 
     # Install Headers (unpinned) — safe now that nvidia is already at TARGET_VERSION.
-    run_cmd "DEBIAN_FRONTEND=noninteractive apt-get install -y proxmox-default-headers"
+    run_cmd "DEBIAN_FRONTEND=noninteractive apt-get install -y proxmox-default-headers" \
+        || warn "Header install reported errors; retrying DKMS repair..."
+    repair_nvidia_dkms
 
     # Post-Install Config
     log "Configuring Host..."
