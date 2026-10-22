@@ -22,7 +22,7 @@ CONTAINERS_REBOOT=(107)
 #                     Changes are staged and apply on next manual restart.
 #                     Use for 24/7 services where you control the restart window.
 #                     Example: Plex, Jellyfin (if always streaming)
-CONTAINERS_STAGING=(105 100 108)
+CONTAINERS_STAGING=(105 100 108 113)
 
 # !Do not list the same container in both arrays! 
 
